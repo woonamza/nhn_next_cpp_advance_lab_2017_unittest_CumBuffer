@@ -33,24 +33,22 @@
 
 //#define CUMBUFFER_DEBUG
 
-namespace cumbuffer_defines
+
+const int DEFAULT_BUFFER_LEN = 1024 * 4;
+const int CACHE_LINE_SIZE = 64;
+
+enum class OP_RESULT : int
 {
-    const int DEFAULT_BUFFER_LEN = 1024 * 4;
-    const int CACHE_LINE_SIZE = 64;
+    OP_RSLT_OK = 0,
+    OP_RSLT_NO_DATA,
+    OP_RSLT_BUFFER_FULL,
+    OP_RSLT_ALLOC_FAILED,
+    OP_RSLT_INVALID_LEN,
+    OP_RSLT_INVALID_USAGE
+};
 
-    enum OP_RESULT
-    {
-        OP_RSLT_OK = 0,
-        OP_RSLT_NO_DATA,
-        OP_RSLT_BUFFER_FULL,
-        OP_RSLT_ALLOC_FAILED,
-        OP_RSLT_INVALID_LEN,
-        OP_RSLT_INVALID_USAGE
-    } ;
-} ;
-
-#ifdef WIN32
-    #define CACHE_ALIGN __declspec(align(cumbuffer_defines::CACHE_LINE_SIZE))  
+#ifdef _WIN32
+    #define CACHE_ALIGN __declspec(align(CACHE_LINE_SIZE))  
 #endif
 
 #if defined __APPLE__ || defined __linux__ 
@@ -58,159 +56,196 @@ namespace cumbuffer_defines
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
-#ifdef WIN32
+#ifdef _WIN32
 class CACHE_ALIGN CumBuffer
 #endif
 #if defined __APPLE__ || defined __linux__ 
 class CumBuffer
 #endif
-{
+{	
   public:
     CumBuffer() 
     {
-        pBuffer_=NULL; 
-        nCumulatedLen_=0;
-        nCurHead_=0;
-        nCurTail_=0;
-        nBufferLen_=0;
+        m_pBuffer=NULL; 
+        m_CumulatedLen=0;
+        m_CurHead=0;
+        m_CurTail=0;
+        m_BufferLen=0;
     }
 
-    virtual ~CumBuffer() { if(pBuffer_) { delete [] pBuffer_; } };
+    virtual ~CumBuffer() 
+	{ 
+		if(m_pBuffer) 
+		{ 
+			delete [] m_pBuffer; 
+		} 
+	};
+
+	CumBuffer(const CumBuffer&) = delete;
+	CumBuffer& operator = (const CumBuffer &) = delete;
+
 
     //------------------------------------------------------------------------
-    cumbuffer_defines::OP_RESULT    Init(int nMaxBufferLen = cumbuffer_defines::DEFAULT_BUFFER_LEN)
+	OP_RESULT    Init(int nMaxBufferLen = DEFAULT_BUFFER_LEN)
     {
-        nBufferLen_ = nMaxBufferLen;
+        m_BufferLen = nMaxBufferLen;
 
         try
         {
-            pBuffer_ = new char [nBufferLen_];
+            m_pBuffer = new char [m_BufferLen];
         }
         catch (std::exception& e)
         {
             std::cerr <<"["<< __func__ <<"-"<<__LINE__ <<"] alloc failed :"<<e.what()  <<"\n"; 
-            strErrMsg_="alloc failed :";
-            strErrMsg_+= e.what();
-            return cumbuffer_defines::OP_RSLT_ALLOC_FAILED;
+            m_strErrMsg="alloc failed :";
+            m_strErrMsg+= e.what();
+            return OP_RESULT::OP_RSLT_ALLOC_FAILED;
         }
 
-        return cumbuffer_defines::OP_RSLT_OK;
+        return OP_RESULT::OP_RSLT_OK;
     }
 
     //------------------------------------------------------------------------
-    cumbuffer_defines::OP_RESULT    Append(size_t nLen, char* pData)
+    OP_RESULT    Append(const size_t nLen, const char* pData)
     {
 #ifdef CUMBUFFER_DEBUG
         std::cout <<"["<< __func__ <<"-"<<__LINE__ <<"] nLen="<<nLen<< "["<< pData<<"]\n";  
         DebugPos(__LINE__);
 #endif
+        OP_RESULT opRet = CheckAppendDataBufferLength(nLen);
 
-        if( nBufferLen_ < nLen )
-        {
-            std::cerr <<"["<< __func__ <<"-"<<__LINE__ <<"] invalid len :"<<nLen <<"\n"; 
-            strErrMsg_="invalid length";
-            return cumbuffer_defines::OP_RSLT_INVALID_LEN;
-        }
-        else if( nBufferLen_ ==  nCumulatedLen_ )
-        {
-            std::cerr <<"["<< __func__ <<"-"<<__LINE__ <<"] buffer full" <<"\n"; 
-            strErrMsg_="buffer full";
-            return cumbuffer_defines::OP_RSLT_BUFFER_FULL;
-        }
+		if (opRet != OP_RESULT::OP_RSLT_OK)
+		{
+			return opRet;
+		}
 
-        if(nCurTail_ < nCurHead_)
+        if(m_CurTail < m_CurHead)
         {
             //tail 이 버퍼 끝을 지난 경우
-            if(nCurHead_ - nCurTail_ >= nLen)
-            {
-                memcpy(pBuffer_ + nCurTail_, pData, nLen);
-                nCurTail_ += nLen;
-                nCumulatedLen_ += nLen;
-#ifdef CUMBUFFER_DEBUG
-                DebugPos(__LINE__);
-#endif
-                return cumbuffer_defines::OP_RSLT_OK;
-            }
-            else
-            {
-                std::cerr <<"["<< __func__ <<"-"<<__LINE__ <<"] buffer full" <<"\n"; 
-                strErrMsg_="buffer full";
-                return cumbuffer_defines::OP_RSLT_BUFFER_FULL;
-            }
+			opRet = CheckAppendDataSpaceAfterRotation(pData, nLen);
+			return opRet;
         }
         else
         {
-            if (nBufferLen_ < nCurTail_ + nLen)
+            if (m_BufferLen < m_CurTail + nLen)  //tail 이후, 남은 버퍼로 모자라는 경우
             {
-                //tail 이후, 남은 버퍼로 모자라는 경우
-                if( nCurTail_ > 0 && 
-                    nLen - (nBufferLen_ - nCurTail_)  <= nCurHead_ )
-                {
-                    //2번 나누어서 들어갈 공간이 있는 경우
-#ifdef CUMBUFFER_DEBUG
-                    DebugPos(__LINE__);
-#endif
+				opRet = AppendDataWhenRotate(pData, nLen);
 
-                    int nFirstBlockLen = nBufferLen_ - nCurTail_;
-                    int nSecondBlockLen = nLen - nFirstBlockLen;
-
-#ifdef CUMBUFFER_DEBUG
-                    std::cout <<"["<< __func__ <<"-"<<__LINE__ <<"] nFirstBlockLen ="<<nFirstBlockLen  
-                              << "/nSecondBlockLen="<<nSecondBlockLen<<"\n"; 
-#endif
-
-                    if(nFirstBlockLen>0)
-                    {
-                        memcpy(pBuffer_+ nCurTail_ , pData, nFirstBlockLen); 
-                    }
-
-                    memcpy(pBuffer_ , pData+(nFirstBlockLen), nSecondBlockLen); 
-
-                    nCurTail_ = nSecondBlockLen;
-                    nCumulatedLen_ += nLen;
-#ifdef CUMBUFFER_DEBUG
-                    DebugPos(__LINE__);
-#endif
-                    return cumbuffer_defines::OP_RSLT_OK;
-                }
-                else
-                {
-                    std::cerr <<"["<< __func__ <<"-"<<__LINE__ <<"] buffer full" <<"\n"; 
-                    strErrMsg_="buffer full";
-                    return cumbuffer_defines::OP_RSLT_BUFFER_FULL;
-                }
+				if (opRet != OP_RESULT::OP_RSLT_OK) {
+					return opRet;
+				}               
             }
             else
             {
                 //most general case
-                memcpy(pBuffer_+nCurTail_ , pData, nLen); 
-                nCurTail_ += nLen;
-                nCumulatedLen_ += nLen;
+                memcpy(m_pBuffer+m_CurTail , pData, nLen); 
+                m_CurTail += nLen;
+                m_CumulatedLen += nLen;
 #ifdef CUMBUFFER_DEBUG
                 DebugPos(__LINE__);
 #endif
-                return cumbuffer_defines::OP_RSLT_OK;
+                return OP_RESULT::OP_RSLT_OK;
             }
         }
 
-        return cumbuffer_defines::OP_RSLT_OK;
+        return OP_RESULT::OP_RSLT_OK;
     }
 
+	OP_RESULT CheckAppendDataBufferLength(size_t appendLength)
+	{
+		if (m_BufferLen < appendLength)
+		{
+			std::cerr << "[" << __func__ << "-" << __LINE__ << "] invalid len :" << appendLength << "\n";
+			m_strErrMsg = "invalid length";
+			return OP_RESULT::OP_RSLT_INVALID_LEN;
+		}
+		else if (m_BufferLen == m_CumulatedLen)
+		{
+			std::cerr << "[" << __func__ << "-" << __LINE__ << "] buffer full" << "\n";
+			m_strErrMsg = "buffer full";
+			return OP_RESULT::OP_RSLT_BUFFER_FULL;
+		}
+
+		return OP_RESULT::OP_RSLT_OK;
+	}
+
+	OP_RESULT CheckAppendDataSpaceAfterRotation(const char* pAppendData, const size_t appendLength)
+	{
+		const auto space = m_CurHead - m_CurTail;
+
+		if (space < appendLength)
+		{
+			std::cerr << "[" << __func__ << "-" << __LINE__ << "] buffer full" << "\n";
+			m_strErrMsg = "buffer full";
+			return OP_RESULT::OP_RSLT_BUFFER_FULL;
+		}
+
+		
+		memcpy(m_pBuffer + m_CurTail, pAppendData, appendLength);
+		m_CurTail += appendLength;
+		m_CumulatedLen += appendLength;
+
+#ifdef CUMBUFFER_DEBUG
+			DebugPos(__LINE__);
+#endif
+		return OP_RESULT::OP_RSLT_OK;		
+	}
+
+	OP_RESULT AppendDataWhenRotate(const char* pAppendData, const size_t appendLength)
+	{
+		const size_t spaceRequiredAfterRotation = appendLength - (m_BufferLen - m_CurTail);
+
+		//2번 나누어서 들어갈 공간이 있는 경우
+		if (m_CurTail > 0 && spaceRequiredAfterRotation <= m_CurHead)
+		{
+#ifdef CUMBUFFER_DEBUG
+			DebugPos(__LINE__);
+#endif
+			int nFirstBlockLen = static_cast<int>(m_BufferLen - m_CurTail);
+			int nSecondBlockLen = static_cast<int>(appendLength - nFirstBlockLen);
+
+#ifdef CUMBUFFER_DEBUG
+			std::cout << "[" << __func__ << "-" << __LINE__ << "] nFirstBlockLen =" << nFirstBlockLen
+				<< "/nSecondBlockLen=" << nSecondBlockLen << "\n";
+#endif
+
+			if (nFirstBlockLen > 0)
+			{
+				memcpy(m_pBuffer + m_CurTail, pAppendData, nFirstBlockLen);
+			}
+
+			memcpy(m_pBuffer, pAppendData + (nFirstBlockLen), nSecondBlockLen);
+
+			m_CurTail = nSecondBlockLen;
+			m_CumulatedLen += appendLength;
+#ifdef CUMBUFFER_DEBUG
+			DebugPos(__LINE__);
+#endif
+			return OP_RESULT::OP_RSLT_OK;
+		}
+		
+		std::cerr << "[" << __func__ << "-" << __LINE__ << "] buffer full" << "\n";
+		m_strErrMsg = "buffer full";
+		return OP_RESULT::OP_RSLT_BUFFER_FULL;
+	}
+
     //------------------------------------------------------------------------
-    cumbuffer_defines::OP_RESULT    PeekData(size_t nLen, char* pDataOut)
+	// 데이터는 가져오지만 head를 이동 시키지 않는다
+    OP_RESULT    PeekData(size_t nLen, char* pDataOut)
     {
         return GetData(nLen, pDataOut, true, false);
     }
 
     //------------------------------------------------------------------------
-    cumbuffer_defines::OP_RESULT    ConsumeData(size_t nLen)
+	// 데이터는 가져오지 않고 head만 이동 시킨다
+    OP_RESULT    ConsumeData(size_t nLen)
     {
         //PeekData 사용해서 처리한 data length 만큼 버퍼내 nCurHead_ 를 이동.
         return GetData(nLen, NULL, false, true);
     }
 
     //------------------------------------------------------------------------
-    cumbuffer_defines::OP_RESULT    GetData(size_t  nLen, 
+    OP_RESULT    GetData(size_t  nLen, 
                                             char*   pDataOut, 
                                             bool    bPeek=false, 
                                             bool    bMoveHeaderOnly=false)
@@ -218,92 +253,92 @@ class CumBuffer
         if(bPeek && bMoveHeaderOnly)
         {
             std::cerr <<"["<< __func__ <<"-"<<__LINE__ <<"] invalid usage" <<"\n"; 
-            strErrMsg_="invalid usage";
-            return cumbuffer_defines::OP_RSLT_INVALID_USAGE;
+            m_strErrMsg="invalid usage";
+            return OP_RESULT::OP_RSLT_INVALID_USAGE;
         }
 
 #ifdef CUMBUFFER_DEBUG
         DebugPos(__LINE__);
 #endif
 
-        cumbuffer_defines::OP_RESULT nRslt = ValidateBuffer(nLen);
-        if(cumbuffer_defines::OP_RSLT_OK!=nRslt )
+        OP_RESULT nRslt = ValidateBuffer(nLen);
+        if(OP_RESULT::OP_RSLT_OK!=nRslt )
         {
-            std::cerr <<"["<< __func__ <<"-"<<__LINE__ <<"] invalid buffer :"<<strErrMsg_ <<"\n"; 
+            std::cerr <<"["<< __func__ <<"-"<<__LINE__ <<"] invalid buffer :"<<m_strErrMsg <<"\n"; 
             return nRslt;
         }
 
-        if(nCurTail_ > nCurHead_)
+        if(m_CurTail > m_CurHead)
         {
             //일반적인 경우
-            if (nCurTail_ < nCurHead_ + nLen)
+            if (m_CurTail < m_CurHead + nLen)
             {
                 std::cerr <<"["<< __func__ <<"-"<<__LINE__ <<"] invalid length :"<<nLen <<"\n"; 
-                strErrMsg_="invalid length";
-                return cumbuffer_defines:: OP_RSLT_INVALID_LEN;
+                m_strErrMsg="invalid length";
+                return OP_RESULT::OP_RSLT_INVALID_LEN;
             }
             else
             {
                 if(!bMoveHeaderOnly)
                 {
-                    memcpy(pDataOut, pBuffer_ + nCurHead_, nLen);
+                    memcpy(pDataOut, m_pBuffer + m_CurHead, nLen);
                 }
                 if(!bPeek)
                 {
-                    nCurHead_ += nLen;
+                    m_CurHead += nLen;
                 }
             }
         }
         else// if(nCurTail_ <= nCurHead_)
         {
-            if (nBufferLen_ < nCurHead_ + nLen)
+            if (m_BufferLen < m_CurHead + nLen)
             {
-                size_t nFirstBlockLen = nBufferLen_ - nCurHead_;
+                size_t nFirstBlockLen = m_BufferLen - m_CurHead;
                 size_t nSecondBlockLen = nLen - nFirstBlockLen;
 #ifdef CUMBUFFER_DEBUG
                 std::cout <<"["<< __func__ <<"-"<<__LINE__ <<"] nFirstBlockLen="<<nFirstBlockLen  
                           << "/nSecondBlockLen="<<nSecondBlockLen<<"\n"; 
 #endif
 
-                if( nCurTail_ > 0 && 
-                    nCurTail_ >= nSecondBlockLen )
+                if( m_CurTail > 0 && 
+                    m_CurTail >= nSecondBlockLen )
                 {
                     if(!bMoveHeaderOnly)
                     {
-                        memcpy(pDataOut , pBuffer_+nCurHead_, nFirstBlockLen); 
-                        memcpy(pDataOut+nFirstBlockLen , pBuffer_, nSecondBlockLen); 
+                        memcpy(pDataOut , m_pBuffer+m_CurHead, nFirstBlockLen); 
+                        memcpy(pDataOut+nFirstBlockLen , m_pBuffer, nSecondBlockLen); 
                     }
 
                     if(!bPeek)
                     {
-                        nCurHead_ =nSecondBlockLen ;
+                        m_CurHead =nSecondBlockLen ;
                     }
                 }
                 else
                 {
                     std::cerr <<"["<< __func__ <<"-"<<__LINE__ <<"] invalid length :"<<nLen  
                               <<" / nFirstBlockLen ="<<nFirstBlockLen << "/nSecondBlockLen="<<nSecondBlockLen<<"\n"; 
-                    strErrMsg_="invalid length";
-                    return cumbuffer_defines:: OP_RSLT_INVALID_LEN;
+                    m_strErrMsg="invalid length";
+                    return OP_RESULT::OP_RSLT_INVALID_LEN;
                 }
             }
             else
             {
                 if(!bMoveHeaderOnly)
                 {
-                    memcpy(pDataOut, pBuffer_ + nCurHead_, nLen);
+                    memcpy(pDataOut, m_pBuffer + m_CurHead, nLen);
                 }
 
                 if(!bPeek)
                 {
-                    nCurHead_ += nLen;
+                    m_CurHead += nLen;
                 }
             }
         }
 
         if(!bPeek)
         {
-            nCumulatedLen_ -= nLen;
+            m_CumulatedLen -= nLen;
         }
 
 #ifdef CUMBUFFER_DEBUG
@@ -311,54 +346,54 @@ class CumBuffer
         DebugPos(__LINE__);
 #endif
 
-        return cumbuffer_defines::OP_RSLT_OK;
+        return OP_RESULT::OP_RSLT_OK;
     }
 
     //------------------------------------------------------------------------
-    cumbuffer_defines::OP_RESULT ValidateBuffer(size_t nLen)
+    OP_RESULT ValidateBuffer(size_t nLen)
     {
-        if(nCumulatedLen_ == 0 )
+        if(m_CumulatedLen == 0 )
         {
-            strErrMsg_="no data";
-            return cumbuffer_defines::OP_RSLT_NO_DATA;
+            m_strErrMsg="no data";
+            return OP_RESULT::OP_RSLT_NO_DATA;
         }
-        else if(nCumulatedLen_ < nLen)
+        else if(m_CumulatedLen < nLen)
         {
-            strErrMsg_="invalid length";
-            return cumbuffer_defines:: OP_RSLT_INVALID_LEN;
+            m_strErrMsg="invalid length";
+            return OP_RESULT::OP_RSLT_INVALID_LEN;
         }
 
-        return cumbuffer_defines::OP_RSLT_OK;
+        return OP_RESULT::OP_RSLT_OK;
     }
         
     //------------------------------------------------------------------------
     size_t GetCumulatedLen()
     {
-        return nCumulatedLen_ ;
+        return m_CumulatedLen ;
     }
 
     //------------------------------------------------------------------------
     size_t GetCapacity()
     {
-        return nBufferLen_ ;
+        return m_BufferLen ;
     }
 
     //------------------------------------------------------------------------
     size_t GetTotalFreeSpace()
     {
-        return nBufferLen_  - nCumulatedLen_;
+        return m_BufferLen  - m_CumulatedLen;
     }
 
     //------------------------------------------------------------------------
     uint64_t GetCurHeadPos()
     {
-        return nCurHead_; 
+        return m_CurHead; 
     }
 
     //------------------------------------------------------------------------
     uint64_t GetCurTailPos()
     {
-        return nCurTail_; 
+        return m_CurTail; 
     }
 
     //------------------------------------------------------------------------
@@ -366,79 +401,77 @@ class CumBuffer
     {
         //current maximun linear buffer size
 
-        if(nCurTail_==nBufferLen_) //nCurTail_ is at last position
+        if(m_CurTail==m_BufferLen) //nCurTail_ is at last position
         {
-            return nBufferLen_ - nCumulatedLen_ ; 
+            return m_BufferLen - m_CumulatedLen ; 
         }
-        else if(nCurHead_ < nCurTail_)
+        else if(m_CurHead < m_CurTail)
         {
-            return nBufferLen_- nCurTail_; 
+            return m_BufferLen- m_CurTail; 
         }
-        else if(nCurHead_ > nCurTail_)
+        else if(m_CurHead > m_CurTail)
         {
-            return nCurHead_-nCurTail_; 
+            return m_CurHead-m_CurTail; 
         }
         else
         {
-            return nBufferLen_- nCurTail_;
+            return m_BufferLen- m_CurTail;
         }
     }
 
     //------------------------------------------------------------------------
     char* GetLinearAppendPtr() //for direct buffer write
     {
-        if(nCurTail_==nBufferLen_) //nCurTail_ is at last position
+        if(m_CurTail==m_BufferLen) //nCurTail_ is at last position
         {
-            if(nBufferLen_!= nCumulatedLen_) //and buffer has free space
+            if(m_BufferLen!= m_CumulatedLen) //and buffer has free space
             {
                 //-> append at 0  
                 //nCurTail_ -> 버퍼 마지막 위치하고, 버퍼에 공간이 존재. -> 처음에 저장
                 //XXX dangerous XXX 
                 //this is not a simple get function, nCurTail_ changes !!
-                nCurTail_ = 0;
+                m_CurTail = 0;
             }
         }
 
-        return (pBuffer_+ nCurTail_);
+        return (m_pBuffer+ m_CurTail);
     }
 
     //------------------------------------------------------------------------
     void IncreaseData(size_t nLen)
     {
-        nCurTail_+= nLen;
-        nCumulatedLen_ +=nLen;
+        m_CurTail+= nLen;
+        m_CumulatedLen +=nLen;
     }
 
     //------------------------------------------------------------------------
     void    DebugPos(int nLine)
     {
-        std::cout <<"line=" <<nLine<<"/ nCurHead_=" << nCurHead_  << "/ nCurTail_= "  << nCurTail_ 
-                  <<" / nBufferLen_=" << nBufferLen_
-                  <<" / nCumulatedLen_=" << nCumulatedLen_
+        std::cout <<"line=" <<nLine<<"/ nCurHead_=" << m_CurHead  << "/ nCurTail_= "  << m_CurTail 
+                  <<" / nBufferLen_=" << m_BufferLen
+                  <<" / nCumulatedLen_=" << m_CumulatedLen
                   <<"\n";
     }
 
     //------------------------------------------------------------------------
     void ReSet()
     {
-        nCumulatedLen_=0;
-        nCurHead_=0;
-        nCurTail_=0;
+        m_CumulatedLen=0;
+        m_CurHead=0;
+        m_CurTail=0;
     }
 
-    std::string GetErrMsg() { return strErrMsg_ ; }
+    std::string GetErrMsg() { return m_strErrMsg ; }
+
 
   private:
-    CumBuffer(const CumBuffer&) ; //= delete;
-    CumBuffer& operator = (const CumBuffer &) ; //= delete;
+    std::string m_strErrMsg;
+    char*       m_pBuffer;
+    size_t      m_BufferLen;
+    size_t      m_CumulatedLen; // 저장된 데이터 길이
 
-    std::string strErrMsg_;
-    char*       pBuffer_;
-    size_t      nBufferLen_;
-    size_t      nCumulatedLen_;
-
-    uint64_t    nCurHead_  ; 
-    uint64_t    nCurTail_  ; 
+    uint64_t    m_CurHead; // 가장 최신 읽기의 마지막 위치
+    uint64_t    m_CurTail; // 가장 최신 쓰기의 마지막 위치
 }
 #if defined __APPLE__ || defined __linux__ 
 CACHE_ALIGN 
